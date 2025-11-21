@@ -1,0 +1,24 @@
+# ReelMaker Requirements
+# Install with: pip install -r requirements.txt
+
+# Audio analysis
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Video processing
+opencv-python>=4.8.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Note: ffmpeg is also required but must be installed separately
+# Windows: choco install ffmpeg
+# Mac: brew install ffmpeg
+# Linux: sudo apt install ffmpeg

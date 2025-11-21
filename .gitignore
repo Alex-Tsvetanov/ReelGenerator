@@ -1,0 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
+# Generated videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.temp.mp4
+
+# Audio files (keep list.txt but ignore the actual audio)
+songs/*.mp3
+songs/*.wav
+songs/*.flac
+songs/individual/*.mp3
+songs/individual/*.wav
+songs/individual/*.flac
+
+# Analysis outputs
+songs/individual/*_analysis.json
+songs/individual/*_analysis.png
+songs/analysis/
+
+# User images
+images/
+demo_images/
+my_images/
+
+# Output files
+output.mp4
+*_output.mp4
+*_reel.mp4
+demo_output.mp4
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

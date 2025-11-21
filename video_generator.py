@@ -1,0 +1,602 @@
+"""
+Video generator that creates viral-style videos by synchronizing images with audio peaks.
+
+This module:
+- Loads images and audio analysis data
+- Applies effects (pulsation, hue shift, rotation) on small peaks
+- Applies transitions (fade, slide) on big peaks
+- Generates the final video
+"""
+
+import numpy as np
+import json
+from pathlib import Path
+from typing import List, Dict, Tuple
+from PIL import Image, ImageEnhance, ImageFilter
+import cv2
+from dataclasses import dataclass
+from enum import Enum
+
+
+class EffectType(Enum):
+    """Types of effects for small peaks."""
+    PULSE = "pulse"
+    HUE_SHIFT = "hue_shift"
+    ROTATE = "rotate"
+    ZOOM = "zoom"
+    BLUR_PULSE = "blur_pulse"
+
+
+class TransitionType(Enum):
+    """Types of transitions for big peaks."""
+    FADE = "fade"
+    SLIDE_LEFT = "slide_left"
+    SLIDE_RIGHT = "slide_right"
+    SLIDE_UP = "slide_up"
+    SLIDE_DOWN = "slide_down"
+    ZOOM_IN = "zoom_in"
+    ZOOM_OUT = "zoom_out"
+
+
+@dataclass
+class EffectEvent:
+    """An effect event at a specific time."""
+    time: float
+    effect_type: EffectType
+    duration: float = 0.15  # Effect duration in seconds
+    intensity: float = 1.0  # Effect intensity (0-1)
+
+
+@dataclass
+class TransitionEvent:
+    """A transition event at a specific time."""
+    time: float
+    from_image_idx: int
+    to_image_idx: int
+    transition_type: TransitionType
+    duration: float = 0.3  # Transition duration in seconds
+
+
+class VideoGenerator:
+    """Generate videos from images and audio analysis."""
+    
+    def __init__(self, 
+                 images_dir: str,
+                 audio_file: str,
+                 analysis_file: str,
+                 output_file: str,
+                 resolution: Tuple[int, int] = (1080, 1920),  # Portrait (width, height)
+                 fps: int = 30):
+        """
+        Initialize the video generator.
+        
+        Args:
+            images_dir: Directory containing input images
+            audio_file: Path to audio file
+            analysis_file: Path to audio analysis JSON
+            output_file: Path for output video
+            resolution: Video resolution (width, height)
+            fps: Frames per second
+        """
+        self.images_dir = Path(images_dir)
+        self.audio_file = Path(audio_file)
+        self.analysis_file = Path(analysis_file)
+        self.output_file = Path(output_file)
+        self.resolution = resolution
+        self.fps = fps
+        
+        self.images = []
+        self.image_backgrounds = []  # Blurred backgrounds for each image
+        self.analysis_data = None
+        self.effect_events = []
+        self.transition_events = []
+        
+    def load_images(self):
+        """Load all images from the images directory."""
+        print(f"Loading images from: {self.images_dir}")
+        
+        # Increase PIL decompression bomb limit for large images
+        Image.MAX_IMAGE_PIXELS = None  # Remove limit (or set to a high value like 500000000)
+        
+        # Supported image formats
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']
+        image_files = []
+        
+        for ext in image_extensions:
+            image_files.extend(self.images_dir.glob(ext))
+            image_files.extend(self.images_dir.glob(ext.upper()))
+        
+        # Sort images
+        image_files = sorted(image_files)
+        
+        print(f"Found {len(image_files)} images")
+        
+        # Load and resize images
+        skipped = 0
+        for i, img_path in enumerate(image_files, 1):
+            try:
+                # Load image
+                img = Image.open(img_path)
+                
+                # Apply EXIF orientation if present (fixes rotated phone photos)
+                try:
+                    from PIL import ImageOps
+                    img = ImageOps.exif_transpose(img)
+                except:
+                    pass  # If EXIF handling fails, continue with original
+                
+                # Convert to RGB
+                img = img.convert('RGB')
+                
+                # Check if image is unusually large and warn
+                if img.size[0] * img.size[1] > 50000000:  # 50 megapixels
+                    print(f"  [{i}/{len(image_files)}] Large image detected: {img_path.name} ({img.size[0]}x{img.size[1]}) - resizing...")
+                
+                # Create both foreground and background
+                foreground, background = self._create_image_with_background(img)
+                
+                # Convert to numpy arrays for cv2
+                self.images.append(np.array(foreground))
+                self.image_backgrounds.append(np.array(background))
+                
+            except Exception as e:
+                print(f"  ✗ Error loading {img_path.name}: {e}")
+                skipped += 1
+                continue
+        
+        if skipped > 0:
+            print(f"  ⚠️  Skipped {skipped} images due to errors")
+        
+        print(f"Loaded {len(self.images)} images")
+        
+        if len(self.images) == 0:
+            raise ValueError("No images found in directory")
+    
+    def _create_image_with_background(self, img: Image.Image) -> tuple:
+        """Create foreground image and blurred background."""
+        target_w, target_h = self.resolution
+        img_w, img_h = img.size
+        
+        # Create blurred background - fit to fill entire frame
+        bg_scale = max(target_w / img_w, target_h / img_h)
+        bg_w = int(img_w * bg_scale)
+        bg_h = int(img_h * bg_scale)
+        background = img.resize((bg_w, bg_h), Image.Resampling.LANCZOS)
+        
+        # Crop background to exact size if needed
+        if bg_w > target_w or bg_h > target_h:
+            left = (bg_w - target_w) // 2
+            top = (bg_h - target_h) // 2
+            background = background.crop((left, top, left + target_w, top + target_h))
+        
+        # Apply blur to background
+        background = background.filter(ImageFilter.GaussianBlur(radius=20))
+        
+        # Create foreground - fit to width
+        fg_scale = target_w / img_w
+        fg_w = target_w
+        fg_h = int(img_h * fg_scale)
+        foreground = img.resize((fg_w, fg_h), Image.Resampling.LANCZOS)
+        
+        # If foreground is taller than target, crop from center
+        if fg_h > target_h:
+            crop_y = (fg_h - target_h) // 2
+            foreground = foreground.crop((0, crop_y, fg_w, crop_y + target_h))
+        # If foreground is shorter, we'll composite it on background later
+        elif fg_h < target_h:
+            # Create a new foreground with transparency info
+            final_fg = Image.new('RGB', (target_w, target_h), (0, 0, 0))
+            paste_y = (target_h - fg_h) // 2
+            final_fg.paste(foreground, (0, paste_y))
+            foreground = final_fg
+        
+        return foreground, background
+    
+    def load_analysis(self):
+        """Load audio analysis data."""
+        print(f"Loading analysis from: {self.analysis_file}")
+        
+        with open(self.analysis_file, 'r') as f:
+            self.analysis_data = json.load(f)
+        
+        print(f"  Duration: {self.analysis_data['duration']:.2f}s")
+        print(f"  Tempo: {self.analysis_data['tempo_bpm']:.1f} BPM")
+        print(f"  Small peaks: {self.analysis_data['num_small_peaks']}")
+        print(f"  Big peaks: {self.analysis_data['num_big_peaks']}")
+    
+    def plan_effects_and_transitions(self):
+        """Plan when effects and transitions should occur."""
+        if not self.analysis_data:
+            raise ValueError("Analysis data not loaded")
+        
+        if not self.images:
+            raise ValueError("Images not loaded")
+        
+        print("\nPlanning effects and transitions...")
+        
+        # Get peak times
+        small_peaks = self.analysis_data['small_peak_times']
+        big_peaks = self.analysis_data['big_peak_times']
+        
+        # Create effect events for small peaks
+        effect_types = list(EffectType)
+        for i, peak_time in enumerate(small_peaks):
+            effect_type = effect_types[i % len(effect_types)]
+            self.effect_events.append(
+                EffectEvent(
+                    time=peak_time,
+                    effect_type=effect_type,
+                    duration=0.15,
+                    intensity=0.8 + np.random.random() * 0.2  # Random intensity
+                )
+            )
+        
+        # Create transition events for big peaks
+        transition_types = list(TransitionType)
+        num_images = len(self.images)
+        
+        for i, peak_time in enumerate(big_peaks):
+            from_idx = i % num_images
+            to_idx = (i + 1) % num_images
+            transition_type = transition_types[i % len(transition_types)]
+            
+            self.transition_events.append(
+                TransitionEvent(
+                    time=peak_time,
+                    from_image_idx=from_idx,
+                    to_image_idx=to_idx,
+                    transition_type=transition_type,
+                    duration=0.3
+                )
+            )
+        
+        print(f"  Planned {len(self.effect_events)} effects")
+        print(f"  Planned {len(self.transition_events)} transitions")
+    
+    def apply_effect(self, frame: np.ndarray, effect: EffectEvent, 
+                    progress: float) -> np.ndarray:
+        """
+        Apply an effect to a frame.
+        
+        Args:
+            frame: Input frame (numpy array)
+            effect: Effect to apply
+            progress: Progress through effect (0-1)
+            
+        Returns:
+            Modified frame
+        """
+        # Convert to PIL for easier manipulation
+        img = Image.fromarray(frame)
+        
+        # Calculate effect strength (ease in-out)
+        strength = np.sin(progress * np.pi) * effect.intensity
+        
+        if effect.effect_type == EffectType.PULSE:
+            # Scale image with edge handling to avoid black glitches
+            scale = 1.0 + strength * 0.15
+            w, h = img.size
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Only scale if we're zooming in (scale > 1)
+            if scale > 1.0:
+                img_scaled = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                # Center crop back to original size
+                left = max(0, (new_w - w) // 2)
+                top = max(0, (new_h - h) // 2)
+                img = img_scaled.crop((left, top, left + w, top + h))
+            # For scale < 1, keep original to avoid black borders
+        
+        elif effect.effect_type == EffectType.HUE_SHIFT:
+            # Adjust color saturation
+            enhancer = ImageEnhance.Color(img)
+            img = enhancer.enhance(1.0 + strength * 0.5)
+        
+        elif effect.effect_type == EffectType.ROTATE:
+            # Rotate image slightly
+            angle = strength * 5.0  # Max 5 degrees
+            img = img.rotate(angle, fillcolor=(0, 0, 0))
+        
+        elif effect.effect_type == EffectType.ZOOM:
+            # Zoom in effect with edge handling
+            scale = 1.0 + strength * 0.2
+            w, h = img.size
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            if scale > 1.0:
+                img_scaled = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                # Center crop
+                left = max(0, (new_w - w) // 2)
+                top = max(0, (new_h - h) // 2)
+                img = img_scaled.crop((left, top, left + w, top + h))
+        
+        elif effect.effect_type == EffectType.BLUR_PULSE:
+            # Apply motion blur
+            blur_amount = strength * 3.0
+            if blur_amount > 0.5:
+                img = img.filter(ImageFilter.GaussianBlur(radius=blur_amount))
+        
+        return np.array(img)
+    
+    def apply_transition(self, frame1: np.ndarray, frame2: np.ndarray,
+                        transition: TransitionEvent, progress: float) -> np.ndarray:
+        """
+        Apply a transition between two frames.
+        
+        Args:
+            frame1: First frame
+            frame2: Second frame
+            transition: Transition to apply
+            progress: Progress through transition (0-1)
+            
+        Returns:
+            Blended frame
+        """
+        h, w = frame1.shape[:2]
+        
+        if transition.transition_type == TransitionType.FADE:
+            # Simple crossfade
+            alpha = progress
+            return cv2.addWeighted(frame1, 1 - alpha, frame2, alpha, 0)
+        
+        elif transition.transition_type == TransitionType.SLIDE_LEFT:
+            # Slide from right to left
+            offset = int(w * progress)
+            result = np.zeros_like(frame1)
+            if offset < w:
+                result[:, :w-offset] = frame1[:, offset:]
+                result[:, w-offset:] = frame2[:, :offset]
+            else:
+                result = frame2
+            return result
+        
+        elif transition.transition_type == TransitionType.SLIDE_RIGHT:
+            # Slide from left to right
+            offset = int(w * progress)
+            result = np.zeros_like(frame1)
+            if offset < w:
+                result[:, offset:] = frame1[:, :w-offset]
+                result[:, :offset] = frame2[:, w-offset:]
+            else:
+                result = frame2
+            return result
+        
+        elif transition.transition_type == TransitionType.SLIDE_UP:
+            # Slide from bottom to top
+            offset = int(h * progress)
+            result = np.zeros_like(frame1)
+            if offset < h:
+                result[:h-offset, :] = frame1[offset:, :]
+                result[h-offset:, :] = frame2[:offset, :]
+            else:
+                result = frame2
+            return result
+        
+        elif transition.transition_type == TransitionType.SLIDE_DOWN:
+            # Slide from top to bottom
+            offset = int(h * progress)
+            result = np.zeros_like(frame1)
+            if offset < h:
+                result[offset:, :] = frame1[:h-offset, :]
+                result[:offset, :] = frame2[h-offset:, :]
+            else:
+                result = frame2
+            return result
+        
+        elif transition.transition_type == TransitionType.ZOOM_IN:
+            # Zoom in from frame1 to frame2
+            scale = 1.0 + progress * 0.5
+            img1 = Image.fromarray(frame1)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img_scaled = img1.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            
+            # Center crop
+            left = (new_w - w) // 2
+            top = (new_h - h) // 2
+            img_cropped = img_scaled.crop((left, top, left + w, top + h))
+            
+            # Fade to frame2
+            return cv2.addWeighted(np.array(img_cropped), 1 - progress, 
+                                 frame2, progress, 0)
+        
+        elif transition.transition_type == TransitionType.ZOOM_OUT:
+            # Zoom out from frame1 to frame2
+            scale = 1.5 - progress * 0.5
+            img1 = Image.fromarray(frame1)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            if new_w > w and new_h > h:
+                img_scaled = img1.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                left = (new_w - w) // 2
+                top = (new_h - h) // 2
+                img_cropped = img_scaled.crop((left, top, left + w, top + h))
+            else:
+                img_cropped = img1
+            
+            # Fade to frame2
+            return cv2.addWeighted(np.array(img_cropped), 1 - progress,
+                                 frame2, progress, 0)
+        
+        return frame2
+    
+    def generate_video(self):
+        """Generate the final video."""
+        print("\nGenerating video...")
+        
+        duration = self.analysis_data['duration']
+        total_frames = int(duration * self.fps)
+        
+        # Setup video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        temp_video = str(self.output_file.with_suffix('.temp.mp4'))
+        out = cv2.VideoWriter(temp_video, fourcc, self.fps, self.resolution)
+        
+        print(f"  Total frames: {total_frames}")
+        print(f"  Duration: {duration:.2f}s")
+        print(f"  Resolution: {self.resolution[0]}x{self.resolution[1]}")
+        print(f"  FPS: {self.fps}")
+        
+        # Track current image and active effects
+        current_image_idx = 0
+        
+        for frame_num in range(total_frames):
+            current_time = frame_num / self.fps
+            
+            # Update current image based on completed transitions
+            for trans in self.transition_events:
+                if current_time >= trans.time + trans.duration:
+                    # Transition completed, use the destination image
+                    current_image_idx = trans.to_image_idx
+            
+            # Get background for current image
+            background = self.image_backgrounds[current_image_idx].copy()
+            
+            # Check for active transitions
+            active_transition = None
+            foreground = None
+            for trans in self.transition_events:
+                if trans.time <= current_time < trans.time + trans.duration:
+                    active_transition = trans
+                    progress = (current_time - trans.time) / trans.duration
+                    frame1 = self.images[trans.from_image_idx]
+                    frame2 = self.images[trans.to_image_idx]
+                    bg1 = self.image_backgrounds[trans.from_image_idx]
+                    bg2 = self.image_backgrounds[trans.to_image_idx]
+                    
+                    # Transition both foreground and background
+                    foreground = self.apply_transition(frame1, frame2, trans, progress)
+                    background = self.apply_transition(bg1, bg2, trans, progress)
+                    break
+            
+            # If no active transition, use current image
+            if active_transition is None:
+                foreground = self.images[current_image_idx].copy()
+                
+                # Apply effects only to foreground (not background)
+                for effect in self.effect_events:
+                    if effect.time <= current_time < effect.time + effect.duration:
+                        progress = (current_time - effect.time) / effect.duration
+                        foreground = self.apply_effect(foreground, effect, progress)
+            
+            # Composite foreground over background
+            # Where foreground is black (padding areas), use background
+            mask = np.all(foreground == [0, 0, 0], axis=-1)
+            frame = foreground.copy()
+            frame[mask] = background[mask]
+            
+            # Convert RGB to BGR for cv2
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Write frame
+            out.write(frame_bgr)
+            
+            # Progress indicator
+            if frame_num % (self.fps * 5) == 0:  # Every 5 seconds
+                progress_pct = (frame_num / total_frames) * 100
+                print(f"  Progress: {progress_pct:.1f}% ({current_time:.1f}s / {duration:.1f}s)")
+        
+        out.release()
+        
+        print(f"\n✓ Video frames generated: {temp_video}")
+        
+        # Add audio using ffmpeg
+        print("Adding audio to video...")
+        final_output = str(self.output_file)
+        
+        import subprocess
+        cmd = [
+            'ffmpeg', '-i', temp_video, '-i', str(self.audio_file),
+            '-c:v', 'libx264', '-c:a', 'aac', '-strict', 'experimental',
+            '-shortest', '-y', final_output
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            print(f"✓ Final video saved: {final_output}")
+            
+            # Remove temp file
+            Path(temp_video).unlink()
+        else:
+            print(f"✗ Error adding audio: {result.stderr}")
+            print(f"  Video without audio saved as: {temp_video}")
+    
+    def create_video(self):
+        """Complete workflow to create a video."""
+        self.load_images()
+        self.load_analysis()
+        self.plan_effects_and_transitions()
+        self.generate_video()
+
+
+def create_viral_video(images_dir: str, 
+                      audio_file: str,
+                      analysis_file: str = None,
+                      output_file: str = "output.mp4",
+                      resolution: Tuple[int, int] = (1080, 1920),
+                      fps: int = 30):
+    """
+    Convenience function to create a viral video.
+    
+    Args:
+        images_dir: Directory containing images
+        audio_file: Path to audio file
+        analysis_file: Path to analysis JSON (if None, will look for matching file)
+        output_file: Output video path
+        resolution: Video resolution (width, height)
+        fps: Frames per second
+    """
+    # Find analysis file if not provided
+    if analysis_file is None:
+        audio_path = Path(audio_file)
+        analysis_file = audio_path.parent / f"{audio_path.stem}_analysis.json"
+        
+        if not analysis_file.exists():
+            raise ValueError(f"Analysis file not found: {analysis_file}")
+    
+    generator = VideoGenerator(
+        images_dir=images_dir,
+        audio_file=audio_file,
+        analysis_file=analysis_file,
+        output_file=output_file,
+        resolution=resolution,
+        fps=fps
+    )
+    
+    generator.create_video()
+    
+    return output_file
+
+
+if __name__ == '__main__':
+    import sys
+    
+    if len(sys.argv) < 3:
+        print("Usage: python video_generator.py <images_dir> <audio_file> [output_file]")
+        print("\nExample:")
+        print('  python video_generator.py images/ "songs/individual/song.mp3" output.mp4')
+        sys.exit(1)
+    
+    images_dir = sys.argv[1]
+    audio_file = sys.argv[2]
+    output_file = sys.argv[3] if len(sys.argv) > 3 else "output.mp4"
+    
+    print("=" * 70)
+    print("VIRAL VIDEO GENERATOR")
+    print("=" * 70)
+    
+    create_viral_video(
+        images_dir=images_dir,
+        audio_file=audio_file,
+        output_file=output_file,
+        resolution=(1080, 1920),  # Portrait for TikTok/Reels
+        fps=30
+    )
+    
+    print("\n" + "=" * 70)
+    print("✓ VIDEO GENERATION COMPLETE!")
+    print("=" * 70)
