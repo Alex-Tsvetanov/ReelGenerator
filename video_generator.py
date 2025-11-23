@@ -12,7 +12,7 @@ import numpy as np
 import json
 from pathlib import Path
 from typing import List, Dict, Tuple
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import cv2
 from dataclasses import dataclass
 from enum import Enum
@@ -60,6 +60,9 @@ class TransitionEvent:
 class VideoGenerator:
     """Generate videos from images and audio analysis."""
     
+    # Maximum dimension for input images to prevent memory issues
+    MAX_IMAGE_DIMENSION = 4000
+    
     def __init__(self, 
                  images_dir: str,
                  audio_file: str,
@@ -87,9 +90,53 @@ class VideoGenerator:
         
         self.images = []
         self.image_backgrounds = []  # Blurred backgrounds for each image
+        self.padding_masks = []  # Boolean masks marking letterbox padding areas
         self.analysis_data = None
         self.effect_events = []
         self.transition_events = []
+    
+    def sanitize_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Sanitize a frame to ensure it meets exact requirements.
+        Fixes corruption from PIL/NumPy/OpenCV dimension mismatches.
+        
+        Args:
+            frame: Input frame (may have wrong shape, dtype, or memory layout)
+            
+        Returns:
+            Sanitized frame with exact target resolution, uint8 dtype, contiguous memory
+        """
+        target_w, target_h = self.resolution
+        
+        # Ensure frame is a numpy array
+        if not isinstance(frame, np.ndarray):
+            frame = np.array(frame)
+        
+        # Ensure uint8 dtype
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        
+        # Ensure 3 channels (RGB)
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+        elif frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+        
+        current_h, current_w = frame.shape[:2]
+        
+        # If dimensions don't match exactly, resize
+        if current_h != target_h or current_w != target_w:
+            frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+        
+        # Ensure contiguous memory layout (fixes OpenCV blend artifacts)
+        if not frame.flags['C_CONTIGUOUS']:
+            frame = np.ascontiguousarray(frame)
+        
+        # Final validation
+        assert frame.shape == (target_h, target_w, 3), f"Frame shape mismatch: {frame.shape} != {(target_h, target_w, 3)}"
+        assert frame.dtype == np.uint8, f"Frame dtype mismatch: {frame.dtype} != uint8"
+        
+        return frame
         
     def load_images(self):
         """Load all images from the images directory."""
@@ -120,7 +167,6 @@ class VideoGenerator:
                 
                 # Apply EXIF orientation if present (fixes rotated phone photos)
                 try:
-                    from PIL import ImageOps
                     img = ImageOps.exif_transpose(img)
                 except:
                     pass  # If EXIF handling fails, continue with original
@@ -128,16 +174,27 @@ class VideoGenerator:
                 # Convert to RGB
                 img = img.convert('RGB')
                 
-                # Check if image is unusually large and warn
-                if img.size[0] * img.size[1] > 50000000:  # 50 megapixels
+                # Downscale very large images to prevent memory issues
+                img_w, img_h = img.size
+                max_dim = max(img_w, img_h)
+                if max_dim > self.MAX_IMAGE_DIMENSION:
+                    scale = self.MAX_IMAGE_DIMENSION / max_dim
+                    new_w = int(img_w * scale)
+                    new_h = int(img_h * scale)
+                    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    print(f"  [{i}/{len(image_files)}] Downscaled {img_path.name} from {max_dim}px to {max(new_w, new_h)}px")
+                elif img.size[0] * img.size[1] > 50000000:  # 50 megapixels
                     print(f"  [{i}/{len(image_files)}] Large image detected: {img_path.name} ({img.size[0]}x{img.size[1]}) - resizing...")
                 
-                # Create both foreground and background
-                foreground, background = self._create_image_with_background(img)
+                # Create foreground, background, and padding mask
+                foreground, background, padding_mask = self._create_image_with_background(img)
                 
-                # Convert to numpy arrays for cv2
-                self.images.append(np.array(foreground))
-                self.image_backgrounds.append(np.array(background))
+                # Convert to numpy arrays and sanitize for consistent format
+                fg_array = self.sanitize_frame(np.array(foreground))
+                bg_array = self.sanitize_frame(np.array(background))
+                self.images.append(fg_array)
+                self.image_backgrounds.append(bg_array)
+                self.padding_masks.append(padding_mask)
                 
             except Exception as e:
                 print(f"  ✗ Error loading {img_path.name}: {e}")
@@ -153,7 +210,7 @@ class VideoGenerator:
             raise ValueError("No images found in directory")
     
     def _create_image_with_background(self, img: Image.Image) -> tuple:
-        """Create foreground image and blurred background."""
+        """Create foreground image, blurred background, and padding mask."""
         target_w, target_h = self.resolution
         img_w, img_h = img.size
         
@@ -178,19 +235,27 @@ class VideoGenerator:
         fg_h = int(img_h * fg_scale)
         foreground = img.resize((fg_w, fg_h), Image.Resampling.LANCZOS)
         
+        # Create padding mask - True where there's letterbox padding
+        padding_mask = np.zeros((target_h, target_w), dtype=bool)
+        
         # If foreground is taller than target, crop from center
         if fg_h > target_h:
             crop_y = (fg_h - target_h) // 2
             foreground = foreground.crop((0, crop_y, fg_w, crop_y + target_h))
+            # No padding in this case
         # If foreground is shorter, we'll composite it on background later
         elif fg_h < target_h:
-            # Create a new foreground with transparency info
+            # Create a new foreground with black bars
             final_fg = Image.new('RGB', (target_w, target_h), (0, 0, 0))
             paste_y = (target_h - fg_h) // 2
             final_fg.paste(foreground, (0, paste_y))
             foreground = final_fg
+            
+            # Mark the black bars (top and bottom) as padding
+            padding_mask[:paste_y, :] = True  # Top padding
+            padding_mask[paste_y + fg_h:, :] = True  # Bottom padding
         
-        return foreground, background
+        return foreground, background, padding_mask
     
     def load_analysis(self):
         """Load audio analysis data."""
@@ -259,15 +324,15 @@ class VideoGenerator:
         Apply an effect to a frame.
         
         Args:
-            frame: Input frame (numpy array)
+            frame: Input frame (numpy array, RGB)
             effect: Effect to apply
             progress: Progress through effect (0-1)
             
         Returns:
-            Modified frame
+            Modified frame with alpha channel (RGBA)
         """
-        # Convert to PIL for easier manipulation
-        img = Image.fromarray(frame)
+        # Convert to PIL with alpha channel for transparency tracking
+        img = Image.fromarray(frame).convert('RGBA')
         
         # Calculate effect strength (ease in-out)
         strength = np.sin(progress * np.pi) * effect.intensity
@@ -294,9 +359,10 @@ class VideoGenerator:
             img = enhancer.enhance(1.0 + strength * 0.5)
         
         elif effect.effect_type == EffectType.ROTATE:
-            # Rotate image slightly
+            # Rotate image with transparent fill for corners
             angle = strength * 5.0  # Max 5 degrees
-            img = img.rotate(angle, fillcolor=(0, 0, 0))
+            # Use expand=True to avoid cropping, then crop back with transparency
+            img = img.rotate(angle, expand=False, resample=Image.Resampling.BICUBIC, fillcolor=(0, 0, 0, 0))
         
         elif effect.effect_type == EffectType.ZOOM:
             # Zoom in effect with edge handling
@@ -318,7 +384,10 @@ class VideoGenerator:
             if blur_amount > 0.5:
                 img = img.filter(ImageFilter.GaussianBlur(radius=blur_amount))
         
-        return np.array(img)
+        # Convert to numpy array (RGBA with alpha channel)
+        result = np.array(img)
+        # Note: RGBA result will be composited with background in main loop
+        return result
     
     def apply_transition(self, frame1: np.ndarray, frame2: np.ndarray,
                         transition: TransitionEvent, progress: float) -> np.ndarray:
@@ -345,44 +414,56 @@ class VideoGenerator:
             # Slide from right to left
             offset = int(w * progress)
             result = np.zeros_like(frame1)
-            if offset < w:
-                result[:, :w-offset] = frame1[:, offset:]
-                result[:, w-offset:] = frame2[:, :offset]
+            if offset < w and offset > 0:
+                # Ensure slices don't exceed bounds
+                w1_slice = min(w - offset, frame1.shape[1] - offset)
+                w2_slice = min(offset, frame2.shape[1])
+                result[:, :w1_slice] = frame1[:, offset:offset + w1_slice]
+                result[:, w-w2_slice:] = frame2[:, :w2_slice]
             else:
-                result = frame2
+                result = frame2.copy()
             return result
         
         elif transition.transition_type == TransitionType.SLIDE_RIGHT:
             # Slide from left to right
             offset = int(w * progress)
             result = np.zeros_like(frame1)
-            if offset < w:
-                result[:, offset:] = frame1[:, :w-offset]
-                result[:, :offset] = frame2[:, w-offset:]
+            if offset < w and offset > 0:
+                # Ensure slices don't exceed bounds
+                w1_slice = min(w - offset, frame1.shape[1])
+                w2_slice = min(offset, frame2.shape[1] - (w - offset))
+                result[:, offset:offset + w1_slice] = frame1[:, :w1_slice]
+                result[:, :w2_slice] = frame2[:, w-w2_slice:w]
             else:
-                result = frame2
+                result = frame2.copy()
             return result
         
         elif transition.transition_type == TransitionType.SLIDE_UP:
             # Slide from bottom to top
             offset = int(h * progress)
             result = np.zeros_like(frame1)
-            if offset < h:
-                result[:h-offset, :] = frame1[offset:, :]
-                result[h-offset:, :] = frame2[:offset, :]
+            if offset < h and offset > 0:
+                # Ensure slices don't exceed bounds
+                h1_slice = min(h - offset, frame1.shape[0] - offset)
+                h2_slice = min(offset, frame2.shape[0])
+                result[:h1_slice, :] = frame1[offset:offset + h1_slice, :]
+                result[h-h2_slice:, :] = frame2[:h2_slice, :]
             else:
-                result = frame2
+                result = frame2.copy()
             return result
         
         elif transition.transition_type == TransitionType.SLIDE_DOWN:
             # Slide from top to bottom
             offset = int(h * progress)
             result = np.zeros_like(frame1)
-            if offset < h:
-                result[offset:, :] = frame1[:h-offset, :]
-                result[:offset, :] = frame2[h-offset:, :]
+            if offset < h and offset > 0:
+                # Ensure slices don't exceed bounds
+                h1_slice = min(h - offset, frame1.shape[0])
+                h2_slice = min(offset, frame2.shape[0] - (h - offset))
+                result[offset:offset + h1_slice, :] = frame1[:h1_slice, :]
+                result[:h2_slice, :] = frame2[h-h2_slice:h, :]
             else:
-                result = frame2
+                result = frame2.copy()
             return result
         
         elif transition.transition_type == TransitionType.ZOOM_IN:
@@ -430,9 +511,9 @@ class VideoGenerator:
         duration = self.analysis_data['duration']
         total_frames = int(duration * self.fps)
         
-        # Setup video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        temp_video = str(self.output_file.with_suffix('.temp.mp4'))
+        # Setup video writer - use lossless codec for temp to avoid artifacts
+        fourcc = cv2.VideoWriter_fourcc(*'FFV1')  # Lossless codec
+        temp_video = str(self.output_file.with_suffix('.temp.avi'))
         out = cv2.VideoWriter(temp_video, fourcc, self.fps, self.resolution)
         
         print(f"  Total frames: {total_frames}")
@@ -452,41 +533,63 @@ class VideoGenerator:
                     # Transition completed, use the destination image
                     current_image_idx = trans.to_image_idx
             
-            # Get background for current image
-            background = self.image_backgrounds[current_image_idx].copy()
+            # Step 1: Fetch base foreground (RGB) and background (RGB)
+            base_foreground_rgb = self.images[current_image_idx].copy()
+            background_rgb = self.image_backgrounds[current_image_idx].copy()
             
-            # Check for active transitions
+            # Step 2: Check for active transitions
             active_transition = None
-            foreground = None
             for trans in self.transition_events:
                 if trans.time <= current_time < trans.time + trans.duration:
                     active_transition = trans
                     progress = (current_time - trans.time) / trans.duration
+                    
+                    # Apply transition to both foreground and background
                     frame1 = self.images[trans.from_image_idx]
                     frame2 = self.images[trans.to_image_idx]
                     bg1 = self.image_backgrounds[trans.from_image_idx]
                     bg2 = self.image_backgrounds[trans.to_image_idx]
                     
-                    # Transition both foreground and background
-                    foreground = self.apply_transition(frame1, frame2, trans, progress)
-                    background = self.apply_transition(bg1, bg2, trans, progress)
+                    base_foreground_rgb = self.apply_transition(frame1, frame2, trans, progress)
+                    background_rgb = self.apply_transition(bg1, bg2, trans, progress)
                     break
             
-            # If no active transition, use current image
-            if active_transition is None:
-                foreground = self.images[current_image_idx].copy()
-                
-                # Apply effects only to foreground (not background)
+            # Step 3: Apply effects to foreground (returns RGBA with alpha channel)
+            foreground_rgba = None
+            has_effect = False
+            
+            if active_transition is None:  # Only apply effects when not transitioning
                 for effect in self.effect_events:
                     if effect.time <= current_time < effect.time + effect.duration:
                         progress = (current_time - effect.time) / effect.duration
-                        foreground = self.apply_effect(foreground, effect, progress)
+                        # apply_effect converts RGB to RGBA and returns transformed image
+                        foreground_rgba = self.apply_effect(base_foreground_rgb, effect, progress)
+                        has_effect = True
+                        break  # Only one effect at a time
             
-            # Composite foreground over background
-            # Where foreground is black (padding areas), use background
-            mask = np.all(foreground == [0, 0, 0], axis=-1)
-            frame = foreground.copy()
-            frame[mask] = background[mask]
+            # Step 4: Composite foreground over background
+            # Start with background as the base
+            frame = background_rgb.copy()
+            
+            if has_effect and foreground_rgba is not None:
+                # Foreground has been transformed and is RGBA
+                # Extract RGB and alpha channels
+                foreground_rgb = foreground_rgba[:, :, :3]
+                alpha_channel = foreground_rgba[:, :, 3]
+                
+                # Create mask: where alpha > 0 (non-transparent pixels)
+                opaque_mask = alpha_channel > 0
+                
+                # Place foreground pixels over background only where opaque
+                # This replaces pixels, no blending
+                frame[opaque_mask] = foreground_rgb[opaque_mask]
+            else:
+                # No effects applied, use original foreground (RGB)
+                # Use the stored padding mask (marks letterbox areas)
+                padding_mask = self.padding_masks[current_image_idx]
+                
+                # Place foreground over background, skipping padding areas
+                frame[~padding_mask] = base_foreground_rgb[~padding_mask]
             
             # Convert RGB to BGR for cv2
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -510,7 +613,11 @@ class VideoGenerator:
         import subprocess
         cmd = [
             'ffmpeg', '-i', temp_video, '-i', str(self.audio_file),
-            '-c:v', 'libx264', '-c:a', 'aac', '-strict', 'experimental',
+            '-c:v', 'libx264',
+            '-preset', 'slow',  # Better quality encoding
+            '-crf', '18',  # High quality (0-51, lower = better)
+            '-pix_fmt', 'yuv420p',  # Compatibility with most players
+            '-c:a', 'aac', '-b:a', '192k',  # High quality audio
             '-shortest', '-y', final_output
         ]
         

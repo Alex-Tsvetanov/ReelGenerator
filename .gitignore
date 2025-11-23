@@ -45,17 +45,17 @@ venv.bak/
 *.temp.mp4
 
 # Audio files (keep list.txt but ignore the actual audio)
-songs/*.mp3
-songs/*.wav
-songs/*.flac
-songs/individual/*.mp3
-songs/individual/*.wav
-songs/individual/*.flac
+# songs/*.mp3
+# songs/*.wav
+# songs/*.flac
+# songs/individual/*.mp3
+# songs/individual/*.wav
+# songs/individual/*.flac
 
 # Analysis outputs
-songs/individual/*_analysis.json
-songs/individual/*_analysis.png
-songs/analysis/
+# songs/individual/*_analysis.json
+# songs/individual/*_analysis.png
+# songs/analysis/
 
 # User images
 images/
@@ -63,6 +63,7 @@ demo_images/
 my_images/
 
 # Output files
+output/
 output.mp4
 *_output.mp4
 *_reel.mp4
