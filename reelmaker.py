@@ -107,7 +107,8 @@ def create_video_command(args):
         output_file=output_file,
         resolution=resolution,
         fps=args.fps,
-        max_duration=args.max_duration
+        max_duration=args.max_duration,
+        min_transition_interval=args.min_transition_interval
     )
     
     print("\n" + "=" * 70)
@@ -166,6 +167,8 @@ Examples:
                               help='Frames per second (default: 30)')
     create_parser.add_argument('--max-duration', type=float,
                               help='Maximum duration in seconds (for testing, uses only first N seconds of audio)')
+    create_parser.add_argument('--min-transition-interval', type=float, default=2.0,
+                              help='Minimum time between image transitions in seconds (default: 2.0, prevents rapid flashing)')
     
     args = parser.parse_args()
     

@@ -70,7 +70,8 @@ class VideoGenerator:
                  output_file: str,
                  resolution: Tuple[int, int] = (1080, 1920),  # Portrait (width, height)
                  fps: int = 30,
-                 max_duration: float = None):
+                 max_duration: float = None,
+                 min_transition_interval: float = 2.0):
         """
         Initialize the video generator.
 
@@ -82,6 +83,7 @@ class VideoGenerator:
             resolution: Video resolution (width, height)
             fps: Frames per second
             max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
+            min_transition_interval: Minimum time (seconds) between transitions (default 2.0)
         """
         self.images_dir = Path(images_dir)
         self.audio_file = Path(audio_file)
@@ -90,6 +92,7 @@ class VideoGenerator:
         self.resolution = resolution
         self.fps = fps
         self.max_duration = max_duration
+        self.min_transition_interval = min_transition_interval
 
         self.images = []
         self.image_backgrounds = []  # Blurred backgrounds for each image
@@ -272,8 +275,13 @@ class VideoGenerator:
         print(f"  Small peaks: {self.analysis_data['num_small_peaks']}")
         print(f"  Big peaks: {self.analysis_data['num_big_peaks']}")
 
-    def plan_effects_and_transitions(self):
-        """Plan when effects and transitions should occur."""
+    def plan_effects_and_transitions(self, min_transition_interval: float = 2.0):
+        """
+        Plan when effects and transitions should occur.
+        
+        Args:
+            min_transition_interval: Minimum time (seconds) between transitions to prevent rapid flashing
+        """
         if not self.analysis_data:
             raise ValueError("Analysis data not loaded")
 
@@ -285,6 +293,20 @@ class VideoGenerator:
         # Get peak times
         small_peaks = self.analysis_data['small_peak_times']
         big_peaks = self.analysis_data['big_peak_times']
+
+        # Filter big peaks to enforce minimum interval between transitions
+        filtered_big_peaks = []
+        last_peak_time = -min_transition_interval  # Allow first peak
+        
+        for peak_time in big_peaks:
+            if peak_time - last_peak_time >= min_transition_interval:
+                filtered_big_peaks.append(peak_time)
+                last_peak_time = peak_time
+        
+        if len(filtered_big_peaks) < len(big_peaks):
+            print(f"  Filtered {len(big_peaks) - len(filtered_big_peaks)} transitions (too close together)")
+        
+        big_peaks = filtered_big_peaks
 
         # Create effect events for small peaks
         effect_types = list(EffectType)
@@ -320,6 +342,9 @@ class VideoGenerator:
 
         print(f"  Planned {len(self.effect_events)} effects")
         print(f"  Planned {len(self.transition_events)} transitions")
+        if self.transition_events:
+            avg_interval = self.analysis_data['duration'] / len(self.transition_events)
+            print(f"  Average time per image: {avg_interval:.2f}s")
 
     def apply_effect(self, frame: np.ndarray, padding_mask: np.ndarray,
                     effect: EffectEvent, progress: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -776,7 +801,7 @@ class VideoGenerator:
         """Complete workflow to create a video."""
         self.load_images()
         self.load_analysis()
-        self.plan_effects_and_transitions()
+        self.plan_effects_and_transitions(min_transition_interval=self.min_transition_interval)
         self.generate_video()
 
 
@@ -786,7 +811,8 @@ def create_viral_video(images_dir: str,
                       output_file: str = "output.mp4",
                       resolution: Tuple[int, int] = (1080, 1920),
                       fps: int = 30,
-                      max_duration: float = None):
+                      max_duration: float = None,
+                      min_transition_interval: float = 2.0):
     """
     Convenience function to create a viral video.
 
@@ -798,6 +824,7 @@ def create_viral_video(images_dir: str,
         resolution: Video resolution (width, height)
         fps: Frames per second
         max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
+        min_transition_interval: Minimum time (seconds) between transitions (default 2.0)
     """
     # Find analysis file if not provided
     if analysis_file is None:
@@ -814,7 +841,8 @@ def create_viral_video(images_dir: str,
         output_file=output_file,
         resolution=resolution,
         fps=fps,
-        max_duration=max_duration
+        max_duration=max_duration,
+        min_transition_interval=min_transition_interval
     )
 
     generator.create_video()
