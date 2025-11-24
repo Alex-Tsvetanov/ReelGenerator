@@ -106,7 +106,8 @@ def create_video_command(args):
         analysis_file=str(analysis_file),
         output_file=output_file,
         resolution=resolution,
-        fps=args.fps
+        fps=args.fps,
+        max_duration=args.max_duration
     )
     
     print("\n" + "=" * 70)
@@ -163,6 +164,8 @@ Examples:
                               default='1080x1920')
     create_parser.add_argument('--fps', type=int, default=30,
                               help='Frames per second (default: 30)')
+    create_parser.add_argument('--max-duration', type=float,
+                              help='Maximum duration in seconds (for testing, uses only first N seconds of audio)')
     
     args = parser.parse_args()
     

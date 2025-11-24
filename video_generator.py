@@ -69,7 +69,8 @@ class VideoGenerator:
                  analysis_file: str,
                  output_file: str,
                  resolution: Tuple[int, int] = (1080, 1920),  # Portrait (width, height)
-                 fps: int = 30):
+                 fps: int = 30,
+                 max_duration: float = None):
         """
         Initialize the video generator.
 
@@ -80,6 +81,7 @@ class VideoGenerator:
             output_file: Path for output video
             resolution: Video resolution (width, height)
             fps: Frames per second
+            max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
         """
         self.images_dir = Path(images_dir)
         self.audio_file = Path(audio_file)
@@ -87,6 +89,7 @@ class VideoGenerator:
         self.output_file = Path(output_file)
         self.resolution = resolution
         self.fps = fps
+        self.max_duration = max_duration
 
         self.images = []
         self.image_backgrounds = []  # Blurred backgrounds for each image
@@ -318,21 +321,25 @@ class VideoGenerator:
         print(f"  Planned {len(self.effect_events)} effects")
         print(f"  Planned {len(self.transition_events)} transitions")
 
-    def apply_effect(self, frame: np.ndarray, effect: EffectEvent,
-                    progress: float) -> np.ndarray:
+    def apply_effect(self, frame: np.ndarray, padding_mask: np.ndarray,
+                    effect: EffectEvent, progress: float) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply an effect to a frame.
+        Apply an effect to a frame and transform the padding mask accordingly.
 
         Args:
             frame: Input frame (numpy array, RGB)
+            padding_mask: Boolean mask marking padding areas
             effect: Effect to apply
             progress: Progress through effect (0-1)
 
         Returns:
-            Modified frame with alpha channel (RGBA)
+            Tuple of (modified frame with alpha channel (RGBA), transformed padding mask)
         """
         # Convert to PIL with alpha channel for transparency tracking
         img = Image.fromarray(frame).convert('RGBA')
+
+        # Convert padding mask to PIL image (255 = padding, 0 = content)
+        mask_img = Image.fromarray((padding_mask * 255).astype(np.uint8), mode='L')
 
         # Calculate effect strength (ease in-out)
         strength = np.sin(progress * np.pi) * effect.intensity
@@ -347,10 +354,12 @@ class VideoGenerator:
             # Only scale if we're zooming in (scale > 1)
             if scale > 1.0:
                 img_scaled = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                mask_scaled = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
                 # Center crop back to original size
                 left = max(0, (new_w - w) // 2)
                 top = max(0, (new_h - h) // 2)
                 img = img_scaled.crop((left, top, left + w, top + h))
+                mask_img = mask_scaled.crop((left, top, left + w, top + h))
             # For scale < 1, keep original to avoid black borders
 
         elif effect.effect_type == EffectType.HUE_SHIFT:
@@ -361,8 +370,10 @@ class VideoGenerator:
         elif effect.effect_type == EffectType.ROTATE:
             # Rotate image with transparent fill for corners
             angle = strength * 5.0  # Max 5 degrees
-            # Use expand=True to avoid cropping, then crop back with transparency
+            # Rotate both image and mask with the same parameters
             img = img.rotate(angle, expand=False, resample=Image.Resampling.BICUBIC, fillcolor=(0, 0, 0, 0))
+            # Rotate mask (255 = padding after rotation becomes padding)
+            mask_img = mask_img.rotate(angle, expand=False, resample=Image.Resampling.NEAREST, fillcolor=255)
 
         elif effect.effect_type == EffectType.ZOOM:
             # Zoom in effect with edge handling
@@ -373,10 +384,12 @@ class VideoGenerator:
 
             if scale > 1.0:
                 img_scaled = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                mask_scaled = mask_img.resize((new_w, new_h), Image.Resampling.NEAREST)
                 # Center crop
                 left = max(0, (new_w - w) // 2)
                 top = max(0, (new_h - h) // 2)
                 img = img_scaled.crop((left, top, left + w, top + h))
+                mask_img = mask_scaled.crop((left, top, left + w, top + h))
 
         elif effect.effect_type == EffectType.BLUR_PULSE:
             # Apply motion blur
@@ -384,92 +397,168 @@ class VideoGenerator:
             if blur_amount > 0.5:
                 img = img.filter(ImageFilter.GaussianBlur(radius=blur_amount))
 
-        # Convert to numpy array (RGBA with alpha channel)
-        result = np.array(img)
+        # Convert to numpy arrays
+        result = np.array(img)  # RGBA with alpha channel
+        transformed_mask = np.array(mask_img) > 127  # Convert back to boolean mask
         # Note: RGBA result will be composited with background in main loop
-        return result
+        return result, transformed_mask
 
     def apply_transition(self, frame1: np.ndarray, frame2: np.ndarray,
-                        transition: TransitionEvent, progress: float) -> np.ndarray:
+                        bg1: np.ndarray, bg2: np.ndarray,
+                        mask1: np.ndarray, mask2: np.ndarray,
+                        transition: TransitionEvent, progress: float) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply a transition between two frames.
+        Apply a transition between two frames with their backgrounds and padding masks.
 
         Args:
-            frame1: First frame
-            frame2: Second frame
+            frame1: First foreground frame
+            frame2: Second foreground frame
+            bg1: First background frame
+            bg2: Second background frame
+            mask1: First padding mask
+            mask2: Second padding mask
             transition: Transition to apply
             progress: Progress through transition (0-1)
 
         Returns:
-            Blended frame
+            Tuple of (blended foreground, blended background)
         """
         h, w = frame1.shape[:2]
 
         if transition.transition_type == TransitionType.FADE:
-            # Simple crossfade
+            # Composite each frame with its background first to avoid black padding
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+            
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+            
+            # Now crossfade the composited images
             alpha = progress
-            return cv2.addWeighted(frame1, 1 - alpha, frame2, alpha, 0)
+            blended = cv2.addWeighted(composite1, 1 - alpha, composite2, alpha, 0)
+            blended_bg = cv2.addWeighted(bg1, 1 - alpha, bg2, alpha, 0)
+            return blended, blended_bg
 
         elif transition.transition_type == TransitionType.SLIDE_LEFT:
-            # Slide from right to left
+            # Slide from right to left - composite each frame with its background first
             offset = int(w * progress)
+
+            # Composite frame1 with bg1
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+
+            # Now slide the composited images
             result = np.zeros_like(frame1)
+            result_bg = np.zeros_like(bg1)
             if offset < w and offset > 0:
-                # Ensure slices don't exceed bounds
-                w1_slice = min(w - offset, frame1.shape[1] - offset)
-                w2_slice = min(offset, frame2.shape[1])
-                result[:, :w1_slice] = frame1[:, offset:offset + w1_slice]
-                result[:, w-w2_slice:] = frame2[:, :w2_slice]
+                w1_slice = min(w - offset, composite1.shape[1] - offset)
+                w2_slice = min(offset, composite2.shape[1])
+                result[:, :w1_slice] = composite1[:, offset:offset + w1_slice]
+                result[:, w-w2_slice:] = composite2[:, :w2_slice]
+                result_bg[:, :w1_slice] = bg1[:, offset:offset + w1_slice]
+                result_bg[:, w-w2_slice:] = bg2[:, :w2_slice]
             else:
-                result = frame2.copy()
-            return result
+                result = composite2.copy()
+                result_bg = bg2.copy()
+
+            # Return composited result and background
+            return result, result_bg
 
         elif transition.transition_type == TransitionType.SLIDE_RIGHT:
-            # Slide from left to right
+            # Slide from left to right - composite each frame with its background first
             offset = int(w * progress)
+
+            # Composite frame1 with bg1
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+
+            # Now slide the composited images
             result = np.zeros_like(frame1)
+            result_bg = np.zeros_like(bg1)
             if offset < w and offset > 0:
-                # Ensure slices don't exceed bounds
-                w1_slice = min(w - offset, frame1.shape[1])
-                w2_slice = min(offset, frame2.shape[1] - (w - offset))
-                result[:, offset:offset + w1_slice] = frame1[:, :w1_slice]
-                result[:, :w2_slice] = frame2[:, w-w2_slice:w]
+                w1_slice = min(w - offset, composite1.shape[1])
+                w2_slice = min(offset, composite2.shape[1] - (w - offset))
+                result[:, offset:offset + w1_slice] = composite1[:, :w1_slice]
+                result[:, :w2_slice] = composite2[:, w-w2_slice:w]
+                result_bg[:, offset:offset + w1_slice] = bg1[:, :w1_slice]
+                result_bg[:, :w2_slice] = bg2[:, w-w2_slice:w]
             else:
-                result = frame2.copy()
-            return result
+                result = composite2.copy()
+                result_bg = bg2.copy()
+
+            return result, result_bg
 
         elif transition.transition_type == TransitionType.SLIDE_UP:
-            # Slide from bottom to top
+            # Slide from bottom to top - composite each frame with its background first
             offset = int(h * progress)
+
+            # Composite frame1 with bg1
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+
+            # Now slide the composited images
             result = np.zeros_like(frame1)
+            result_bg = np.zeros_like(bg1)
             if offset < h and offset > 0:
-                # Ensure slices don't exceed bounds
-                h1_slice = min(h - offset, frame1.shape[0] - offset)
-                h2_slice = min(offset, frame2.shape[0])
-                result[:h1_slice, :] = frame1[offset:offset + h1_slice, :]
-                result[h-h2_slice:, :] = frame2[:h2_slice, :]
+                h1_slice = min(h - offset, composite1.shape[0] - offset)
+                h2_slice = min(offset, composite2.shape[0])
+                result[:h1_slice, :] = composite1[offset:offset + h1_slice, :]
+                result[h-h2_slice:, :] = composite2[:h2_slice, :]
+                result_bg[:h1_slice, :] = bg1[offset:offset + h1_slice, :]
+                result_bg[h-h2_slice:, :] = bg2[:h2_slice, :]
             else:
-                result = frame2.copy()
-            return result
+                result = composite2.copy()
+                result_bg = bg2.copy()
+
+            return result, result_bg
 
         elif transition.transition_type == TransitionType.SLIDE_DOWN:
-            # Slide from top to bottom
+            # Slide from top to bottom - composite each frame with its background first
             offset = int(h * progress)
+
+            # Composite frame1 with bg1
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+
+            # Now slide the composited images
             result = np.zeros_like(frame1)
+            result_bg = np.zeros_like(bg1)
             if offset < h and offset > 0:
-                # Ensure slices don't exceed bounds
-                h1_slice = min(h - offset, frame1.shape[0])
-                h2_slice = min(offset, frame2.shape[0] - (h - offset))
-                result[offset:offset + h1_slice, :] = frame1[:h1_slice, :]
-                result[:h2_slice, :] = frame2[h-h2_slice:h, :]
+                h1_slice = min(h - offset, composite1.shape[0])
+                h2_slice = min(offset, composite2.shape[0] - (h - offset))
+                result[offset:offset + h1_slice, :] = composite1[:h1_slice, :]
+                result[:h2_slice, :] = composite2[h-h2_slice:h, :]
+                result_bg[offset:offset + h1_slice, :] = bg1[:h1_slice, :]
+                result_bg[:h2_slice, :] = bg2[h-h2_slice:h, :]
             else:
-                result = frame2.copy()
-            return result
+                result = composite2.copy()
+                result_bg = bg2.copy()
+
+            return result, result_bg
 
         elif transition.transition_type == TransitionType.ZOOM_IN:
-            # Zoom in from frame1 to frame2
+            # Zoom in from frame1 to frame2 - composite first, then zoom
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
             scale = 1.0 + progress * 0.5
-            img1 = Image.fromarray(frame1)
+            img1 = Image.fromarray(composite1)
             new_w = int(w * scale)
             new_h = int(h * scale)
             img_scaled = img1.resize((new_w, new_h), Image.Resampling.LANCZOS)
@@ -479,14 +568,23 @@ class VideoGenerator:
             top = (new_h - h) // 2
             img_cropped = img_scaled.crop((left, top, left + w, top + h))
 
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
+
             # Fade to frame2
-            return cv2.addWeighted(np.array(img_cropped), 1 - progress,
-                                 frame2, progress, 0)
+            blended = cv2.addWeighted(np.array(img_cropped), 1 - progress,
+                                     composite2, progress, 0)
+            blended_bg = cv2.addWeighted(bg1, 1 - progress, bg2, progress, 0)
+            return blended, blended_bg
 
         elif transition.transition_type == TransitionType.ZOOM_OUT:
-            # Zoom out from frame1 to frame2
+            # Zoom out from frame1 to frame2 - composite first, then zoom
+            composite1 = bg1.copy()
+            composite1[~mask1] = frame1[~mask1]
+
             scale = 1.5 - progress * 0.5
-            img1 = Image.fromarray(frame1)
+            img1 = Image.fromarray(composite1)
             new_w = int(w * scale)
             new_h = int(h * scale)
 
@@ -498,17 +596,29 @@ class VideoGenerator:
             else:
                 img_cropped = img1
 
-            # Fade to frame2
-            return cv2.addWeighted(np.array(img_cropped), 1 - progress,
-                                 frame2, progress, 0)
+            # Composite frame2 with bg2
+            composite2 = bg2.copy()
+            composite2[~mask2] = frame2[~mask2]
 
-        return frame2
+            # Fade to frame2
+            blended = cv2.addWeighted(np.array(img_cropped), 1 - progress,
+                                     composite2, progress, 0)
+            blended_bg = cv2.addWeighted(bg1, 1 - progress, bg2, progress, 0)
+            return blended, blended_bg
+
+        return frame2, bg2
 
     def generate_video(self):
         """Generate the final video."""
         print("\nGenerating video...")
 
         duration = self.analysis_data['duration']
+        
+        # Apply max_duration limit if specified
+        if self.max_duration is not None and self.max_duration < duration:
+            duration = self.max_duration
+            print(f"  Limiting duration to {duration:.2f}s for testing")
+        
         total_frames = int(duration * self.fps)
 
         # Setup video writer - use lossless codec for temp to avoid artifacts
@@ -544,49 +654,76 @@ class VideoGenerator:
                     active_transition = trans
                     progress = (current_time - trans.time) / trans.duration
 
-                    # Apply transition to both foreground and background
+                    # Apply transition with foreground, background, and padding masks
                     frame1 = self.images[trans.from_image_idx]
                     frame2 = self.images[trans.to_image_idx]
                     bg1 = self.image_backgrounds[trans.from_image_idx]
                     bg2 = self.image_backgrounds[trans.to_image_idx]
+                    mask1 = self.padding_masks[trans.from_image_idx]
+                    mask2 = self.padding_masks[trans.to_image_idx]
 
-                    base_foreground_rgb = self.apply_transition(frame1, frame2, trans, progress)
-                    background_rgb = self.apply_transition(bg1, bg2, trans, progress)
+                    # Transition returns already composited result for slides
+                    result_fg, result_bg = self.apply_transition(
+                        frame1, frame2, bg1, bg2, mask1, mask2, trans, progress
+                    )
+
+                    # For slide transitions, result is already composited, use directly
+                    if trans.transition_type in [TransitionType.SLIDE_LEFT, TransitionType.SLIDE_RIGHT,
+                                                  TransitionType.SLIDE_UP, TransitionType.SLIDE_DOWN,
+                                                  TransitionType.ZOOM_IN, TransitionType.ZOOM_OUT]:
+                        # Result is already composited, so we'll handle it specially
+                        frame = result_fg
+                        background_rgb = result_bg
+                        # Skip step 4 by using a flag
+                        base_foreground_rgb = None
+                    else:
+                        # For FADE, we got blended foreground/background separately
+                        base_foreground_rgb = result_fg
+                        background_rgb = result_bg
                     break
 
-            # Step 3: Apply effects to foreground (returns RGBA with alpha channel)
+            # Step 3: Apply effects to foreground (returns RGBA with alpha channel and transformed mask)
             foreground_rgba = None
+            transformed_padding_mask = self.padding_masks[current_image_idx]
             has_effect = False
 
             if active_transition is None:  # Only apply effects when not transitioning
                 for effect in self.effect_events:
                     if effect.time <= current_time < effect.time + effect.duration:
                         progress = (current_time - effect.time) / effect.duration
-                        # apply_effect converts RGB to RGBA and returns transformed image
-                        foreground_rgba = self.apply_effect(base_foreground_rgb, effect, progress)
+                        # apply_effect converts RGB to RGBA and returns transformed image and mask
+                        foreground_rgba, transformed_padding_mask = self.apply_effect(
+                            base_foreground_rgb,
+                            self.padding_masks[current_image_idx],
+                            effect,
+                            progress
+                        )
                         has_effect = True
                         break  # Only one effect at a time
 
             # Step 4: Composite foreground over background
-            # Start with background as the base
-            frame = background_rgb.copy()
-
-            if has_effect and foreground_rgba is not None:
+            # Skip if already composited by transition (slide/zoom)
+            if base_foreground_rgb is None:
+                # Frame already set by transition, skip compositing
+                pass
+            elif has_effect and foreground_rgba is not None:
+                # Start with background as the base
+                frame = background_rgb.copy()
                 # Foreground has been transformed and is RGBA
                 # Extract RGB and alpha channels
                 foreground_rgb = foreground_rgba[:, :, :3]
                 alpha_channel = foreground_rgba[:, :, 3]
 
-                # Get padding mask to keep background visible in letterbox areas
-                padding_mask = self.padding_masks[current_image_idx]
-
+                # Use the transformed padding mask (accounts for rotation, scaling, etc.)
                 # Create mask: where alpha > 0 (non-transparent pixels) AND not in padding
-                opaque_mask = (alpha_channel > 0) & (~padding_mask)
+                opaque_mask = (alpha_channel > 0) & (~transformed_padding_mask)
 
                 # Place foreground pixels over background only where opaque and not padding
-                # This preserves the blurred background in letterbox areas
+                # This preserves the blurred background in letterbox areas and rotated corners
                 frame[opaque_mask] = foreground_rgb[opaque_mask]
             else:
+                # Start with background as the base
+                frame = background_rgb.copy()
                 # No effects applied, use original foreground (RGB)
                 # Use the stored padding mask (marks letterbox areas)
                 padding_mask = self.padding_masks[current_image_idx]
@@ -648,7 +785,8 @@ def create_viral_video(images_dir: str,
                       analysis_file: str = None,
                       output_file: str = "output.mp4",
                       resolution: Tuple[int, int] = (1080, 1920),
-                      fps: int = 30):
+                      fps: int = 30,
+                      max_duration: float = None):
     """
     Convenience function to create a viral video.
 
@@ -659,6 +797,7 @@ def create_viral_video(images_dir: str,
         output_file: Output video path
         resolution: Video resolution (width, height)
         fps: Frames per second
+        max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
     """
     # Find analysis file if not provided
     if analysis_file is None:
@@ -674,7 +813,8 @@ def create_viral_video(images_dir: str,
         analysis_file=analysis_file,
         output_file=output_file,
         resolution=resolution,
-        fps=fps
+        fps=fps,
+        max_duration=max_duration
     )
 
     generator.create_video()
