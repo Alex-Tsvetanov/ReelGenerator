@@ -71,7 +71,8 @@ class VideoGenerator:
                  resolution: Tuple[int, int] = (1080, 1920),  # Portrait (width, height)
                  fps: int = 30,
                  max_duration: float = None,
-                 min_transition_interval: float = 2.0):
+                 min_transition_interval: float = 0.75,
+                 beat_method: str = 'fullspectrum'):
         """
         Initialize the video generator.
 
@@ -83,7 +84,7 @@ class VideoGenerator:
             resolution: Video resolution (width, height)
             fps: Frames per second
             max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
-            min_transition_interval: Minimum time (seconds) between transitions (default 2.0)
+            min_transition_interval: Minimum time between transitions in seconds
         """
         self.images_dir = Path(images_dir)
         self.audio_file = Path(audio_file)
@@ -93,6 +94,7 @@ class VideoGenerator:
         self.fps = fps
         self.max_duration = max_duration
         self.min_transition_interval = min_transition_interval
+        self.beat_method = beat_method
 
         self.images = []
         self.image_backgrounds = []  # Blurred backgrounds for each image
@@ -160,7 +162,8 @@ class VideoGenerator:
             image_files.extend(self.images_dir.glob(ext.upper()))
 
         # Sort images
-        image_files = sorted(image_files)
+        import random
+        image_files = random.sample(sorted(image_files), k=len(image_files))
 
         print(f"Found {len(image_files)} images")
 
@@ -268,14 +271,35 @@ class VideoGenerator:
         print(f"Loading analysis from: {self.analysis_file}")
 
         with open(self.analysis_file, 'r') as f:
-            self.analysis_data = json.load(f)
+            analysis_raw = json.load(f)
+        
+        # Check if beat method exists in analysis
+        if self.beat_method not in analysis_raw:
+            print(f"  Warning: Beat method '{self.beat_method}' not found in analysis")
+            print(f"  Available methods: {[k for k in analysis_raw.keys() if k in ['fullspectrum', 'percussive', 'lowfreq', 'demucs']]}")
+            print(f"  Falling back to 'fullspectrum'")
+            self.beat_method = 'fullspectrum'
+        
+        # Extract the selected method's data
+        method_data = analysis_raw[self.beat_method]
+        
+        # Create analysis_data with the selected method's peaks
+        self.analysis_data = {
+            'duration': analysis_raw['duration'],
+            'tempo_bpm': method_data['tempo_bpm'],
+            'small_peak_times': method_data['small_peak_times'],
+            'big_peak_times': method_data['big_peak_times'],
+            'num_small_peaks': len(method_data['small_peak_times']),
+            'num_big_peaks': len(method_data['big_peak_times']),
+        }
 
+        print(f"  Using beat method: {self.beat_method}")
         print(f"  Duration: {self.analysis_data['duration']:.2f}s")
         print(f"  Tempo: {self.analysis_data['tempo_bpm']:.1f} BPM")
         print(f"  Small peaks: {self.analysis_data['num_small_peaks']}")
         print(f"  Big peaks: {self.analysis_data['num_big_peaks']}")
 
-    def plan_effects_and_transitions(self, min_transition_interval: float = 2.0):
+    def plan_effects_and_transitions(self, min_transition_interval: float = 0.75):
         """
         Plan when effects and transitions should occur.
         
@@ -321,11 +345,23 @@ class VideoGenerator:
                 )
             )
 
-        # Create transition events for big peaks
+        # Create transition events for big peaks with minimum interval filtering
         transition_types = list(TransitionType)
         num_images = len(self.images)
+        
+        # Filter big peaks to enforce minimum transition interval
+        filtered_big_peaks = []
+        last_transition_time = -999  # Start with a large negative value
+        
+        for peak_time in big_peaks:
+            if peak_time - last_transition_time >= self.min_transition_interval:
+                filtered_big_peaks.append(peak_time)
+                last_transition_time = peak_time
+        
+        if len(filtered_big_peaks) < len(big_peaks):
+            print(f"  Filtered {len(big_peaks) - len(filtered_big_peaks)} transitions (too close together)")
 
-        for i, peak_time in enumerate(big_peaks):
+        for i, peak_time in enumerate(filtered_big_peaks):
             from_idx = i % num_images
             to_idx = (i + 1) % num_images
             transition_type = transition_types[i % len(transition_types)]
@@ -371,7 +407,7 @@ class VideoGenerator:
 
         if effect.effect_type == EffectType.PULSE:
             # Scale image with edge handling to avoid black glitches
-            scale = 1.0 + strength * 0.15
+            scale = 1.0 + strength * 0.30
             w, h = img.size
             new_w = int(w * scale)
             new_h = int(h * scale)
@@ -390,11 +426,11 @@ class VideoGenerator:
         elif effect.effect_type == EffectType.HUE_SHIFT:
             # Adjust color saturation
             enhancer = ImageEnhance.Color(img)
-            img = enhancer.enhance(1.0 + strength * 0.5)
+            img = enhancer.enhance(1.0 + strength * 1.5)
 
         elif effect.effect_type == EffectType.ROTATE:
             # Rotate image with transparent fill for corners
-            angle = strength * 5.0  # Max 5 degrees
+            angle = strength * 15.0  # Max 15 degrees
             # Rotate both image and mask with the same parameters
             img = img.rotate(angle, expand=False, resample=Image.Resampling.BICUBIC, fillcolor=(0, 0, 0, 0))
             # Rotate mask (255 = padding after rotation becomes padding)
@@ -801,7 +837,7 @@ class VideoGenerator:
         """Complete workflow to create a video."""
         self.load_images()
         self.load_analysis()
-        self.plan_effects_and_transitions(min_transition_interval=self.min_transition_interval)
+        self.plan_effects_and_transitions()
         self.generate_video()
 
 
@@ -812,7 +848,8 @@ def create_viral_video(images_dir: str,
                       resolution: Tuple[int, int] = (1080, 1920),
                       fps: int = 30,
                       max_duration: float = None,
-                      min_transition_interval: float = 2.0):
+                      min_transition_interval: float = 0.75,
+                      beat_method: str = 'fullspectrum'):
     """
     Convenience function to create a viral video.
 
@@ -824,7 +861,8 @@ def create_viral_video(images_dir: str,
         resolution: Video resolution (width, height)
         fps: Frames per second
         max_duration: Maximum duration in seconds (for testing, uses only first N seconds)
-        min_transition_interval: Minimum time (seconds) between transitions (default 2.0)
+        min_transition_interval: Minimum time between transitions in seconds
+        beat_method: Which beat detection method to use (fullspectrum, percussive, lowfreq, demucs)
     """
     # Find analysis file if not provided
     if analysis_file is None:
@@ -842,7 +880,8 @@ def create_viral_video(images_dir: str,
         resolution=resolution,
         fps=fps,
         max_duration=max_duration,
-        min_transition_interval=min_transition_interval
+        min_transition_interval=min_transition_interval,
+        beat_method=beat_method
     )
 
     generator.create_video()

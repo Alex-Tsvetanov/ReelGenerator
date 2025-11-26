@@ -14,6 +14,17 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Tuple
 import json
+import tempfile
+import shutil
+
+# Optional demucs import for vocal removal
+try:
+    from demucs.pretrained import get_model
+    from demucs.apply import apply_model
+    import torch
+    DEMUCS_AVAILABLE = True
+except ImportError:
+    DEMUCS_AVAILABLE = False
 
 
 class AudioAnalyzer:
@@ -154,16 +165,248 @@ class AudioAnalyzer:
         
         return small_peak_times, big_peak_times
     
+    def detect_peaks_percussive(self,
+                               small_peak_percentile: float = 70,
+                               big_peak_percentile: float = 90) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Detect peaks using harmonic-percussive separation (isolates drums/rhythm).
+        Better for songs with vocals/melody that interfere with rhythm detection.
+        
+        Args:
+            small_peak_percentile: Percentile threshold for small peaks
+            big_peak_percentile: Percentile threshold for big peaks
+            
+        Returns:
+            Tuple of (small_peak_times, big_peak_times)
+        """
+        if self.y is None:
+            raise ValueError("Audio not loaded. Call load_audio() first.")
+        
+        print("\nDetecting peaks using harmonic-percussive separation...")
+        
+        # Separate harmonic and percussive components
+        y_harmonic, y_percussive = librosa.effects.hpss(self.y)
+        
+        # Compute onset strength on percussive component only
+        hop_length = 512
+        onset_percussive = librosa.onset.onset_strength(y=y_percussive, sr=self.sr)
+        
+        # Find local maxima
+        from scipy.signal import find_peaks
+        min_distance = max(2, self.sr // hop_length // 8)
+        
+        peaks, _ = find_peaks(
+            onset_percussive,
+            distance=min_distance,
+            prominence=0.1
+        )
+        
+        peak_heights = onset_percussive[peaks]
+        
+        if len(peak_heights) == 0:
+            print("  Warning: No percussive peaks detected, falling back to beat times")
+            return self.beat_times, self.beat_times[::4]
+        
+        # Determine thresholds
+        small_threshold = np.percentile(peak_heights, small_peak_percentile)
+        big_threshold = np.percentile(peak_heights, big_peak_percentile)
+        
+        # Classify peaks
+        small_peak_indices = peaks[peak_heights >= small_threshold]
+        big_peak_indices = peaks[peak_heights >= big_threshold]
+        
+        # Convert to time
+        small_peak_times = librosa.frames_to_time(small_peak_indices, sr=self.sr)
+        big_peak_times = librosa.frames_to_time(big_peak_indices, sr=self.sr)
+        
+        # Remove big peaks from small peaks
+        small_peak_times = np.array([t for t in small_peak_times 
+                                     if not any(abs(t - bt) < 0.05 for bt in big_peak_times)])
+        
+        print(f"  Percussive - Small peaks: {len(small_peak_times)}")
+        print(f"  Percussive - Big peaks: {len(big_peak_times)}")
+        
+        return small_peak_times, big_peak_times
+    
+    def detect_peaks_lowfreq(self,
+                            small_peak_percentile: float = 70,
+                            big_peak_percentile: float = 90) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Detect peaks using low-frequency filtering (bass/kick drums only).
+        Ignores high-frequency content like vocals, cymbals, etc.
+        
+        Args:
+            small_peak_percentile: Percentile threshold for small peaks
+            big_peak_percentile: Percentile threshold for big peaks
+            
+        Returns:
+            Tuple of (small_peak_times, big_peak_times)
+        """
+        if self.y is None:
+            raise ValueError("Audio not loaded. Call load_audio() first.")
+        
+        print("\nDetecting peaks using low-frequency filtering...")
+        
+        # Apply low-pass filter to isolate bass frequencies (< 200 Hz)
+        from scipy import signal
+        nyquist = self.sr / 2
+        cutoff = 200  # Hz
+        normalized_cutoff = cutoff / nyquist
+        b, a = signal.butter(4, normalized_cutoff, btype='low')
+        y_lowfreq = signal.filtfilt(b, a, self.y)
+        
+        # Compute onset strength on low-frequency component
+        hop_length = 512
+        onset_lowfreq = librosa.onset.onset_strength(y=y_lowfreq, sr=self.sr)
+        
+        # Find local maxima
+        from scipy.signal import find_peaks
+        min_distance = max(2, self.sr // hop_length // 8)
+        
+        peaks, _ = find_peaks(
+            onset_lowfreq,
+            distance=min_distance,
+            prominence=0.1
+        )
+        
+        peak_heights = onset_lowfreq[peaks]
+        
+        if len(peak_heights) == 0:
+            print("  Warning: No low-frequency peaks detected, falling back to beat times")
+            return self.beat_times, self.beat_times[::4]
+        
+        # Determine thresholds
+        small_threshold = np.percentile(peak_heights, small_peak_percentile)
+        big_threshold = np.percentile(peak_heights, big_peak_percentile)
+        
+        # Classify peaks
+        small_peak_indices = peaks[peak_heights >= small_threshold]
+        big_peak_indices = peaks[peak_heights >= big_threshold]
+        
+        # Convert to time
+        small_peak_times = librosa.frames_to_time(small_peak_indices, sr=self.sr)
+        big_peak_times = librosa.frames_to_time(big_peak_indices, sr=self.sr)
+        
+        # Remove big peaks from small peaks
+        small_peak_times = np.array([t for t in small_peak_times 
+                                     if not any(abs(t - bt) < 0.05 for bt in big_peak_times)])
+        
+        print(f"  Low-frequency - Small peaks: {len(small_peak_times)}")
+        print(f"  Low-frequency - Big peaks: {len(big_peak_times)}")
+        
+        return small_peak_times, big_peak_times
+    
+    def detect_peaks_demucs(self,
+                           small_peak_percentile: float = 70,
+                           big_peak_percentile: float = 90) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Detect peaks using Demucs for state-of-the-art vocal removal.
+        Provides the cleanest beat detection by isolating drums stem.
+        
+        Args:
+            small_peak_percentile: Percentile threshold for small peaks
+            big_peak_percentile: Percentile threshold for big peaks
+            
+        Returns:
+            Tuple of (small_peak_times, big_peak_times)
+        """
+        if not DEMUCS_AVAILABLE:
+            print("  Warning: Demucs not available, skipping")
+            return np.array([]), np.array([])
+        
+        if self.y is None:
+            raise ValueError("Audio not loaded. Call load_audio() first.")
+        
+        print("\nDetecting peaks using Demucs (vocal removal)...")
+        print("  Loading Demucs model (this may take a moment)...")
+        
+        try:
+            # Load the default Demucs model (htdemucs)
+            model = get_model('htdemucs')
+            model.eval()
+            
+            # Prepare audio (convert to stereo if mono, and add batch dimension)
+            if len(self.y.shape) == 1:
+                # Mono to stereo
+                audio_tensor = torch.from_numpy(self.y).float()
+                audio_tensor = torch.stack([audio_tensor, audio_tensor])  # (2, samples)
+            else:
+                audio_tensor = torch.from_numpy(self.y.T).float()  # (2, samples)
+            
+            audio_tensor = audio_tensor.unsqueeze(0)  # Add batch dimension: (1, 2, samples)
+            
+            # Apply model to separate stems
+            print("  Separating stems (drums, bass, vocals, other)...")
+            with torch.no_grad():
+                sources = apply_model(model, audio_tensor, device='cpu')
+            
+            # Extract drums stem (index 0 in htdemucs: drums, bass, other, vocals)
+            drums = sources[0, 0].numpy()  # (2, samples)
+            
+            # Convert stereo to mono
+            drums_mono = np.mean(drums, axis=0)
+            
+            # Compute onset strength on drums only
+            hop_length = 512
+            onset_drums = librosa.onset.onset_strength(y=drums_mono, sr=self.sr)
+            
+            # Find local maxima
+            from scipy.signal import find_peaks
+            min_distance = max(2, self.sr // hop_length // 8)
+            
+            peaks, _ = find_peaks(
+                onset_drums,
+                distance=min_distance,
+                prominence=0.1
+            )
+            
+            peak_heights = onset_drums[peaks]
+            
+            if len(peak_heights) == 0:
+                print("  Warning: No Demucs peaks detected, falling back to beat times")
+                return self.beat_times, self.beat_times[::4]
+            
+            # Determine thresholds
+            small_threshold = np.percentile(peak_heights, small_peak_percentile)
+            big_threshold = np.percentile(peak_heights, big_peak_percentile)
+            
+            # Classify peaks
+            small_peak_indices = peaks[peak_heights >= small_threshold]
+            big_peak_indices = peaks[peak_heights >= big_threshold]
+            
+            # Convert to time
+            small_peak_times = librosa.frames_to_time(small_peak_indices, sr=self.sr)
+            big_peak_times = librosa.frames_to_time(big_peak_indices, sr=self.sr)
+            
+            # Remove big peaks from small peaks
+            small_peak_times = np.array([t for t in small_peak_times 
+                                         if not any(abs(t - bt) < 0.05 for bt in big_peak_times)])
+            
+            print(f"  Demucs (drums only) - Small peaks: {len(small_peak_times)}")
+            print(f"  Demucs (drums only) - Big peaks: {len(big_peak_times)}")
+            
+            return small_peak_times, big_peak_times
+            
+        except Exception as e:
+            print(f"  Error using Demucs: {e}")
+            print("  Falling back to empty results")
+            return np.array([]), np.array([])
+    
     def analyze_full(self) -> Dict:
         """
-        Perform complete audio analysis.
+        Perform complete audio analysis with multiple detection methods.
         
         Returns:
-            Dictionary with all analysis results
+            Dictionary with all analysis results including alternative detection methods
         """
         self.load_audio()
         tempo, beat_times = self.analyze_tempo_and_beats()
         small_peaks, big_peaks = self.detect_energy_peaks()
+        
+        # Additional detection methods
+        small_peaks_percussive, big_peaks_percussive = self.detect_peaks_percussive()
+        small_peaks_lowfreq, big_peaks_lowfreq = self.detect_peaks_lowfreq()
+        small_peaks_demucs, big_peaks_demucs = self.detect_peaks_demucs()
         
         results = {
             'audio_file': str(self.audio_path),
@@ -171,12 +414,34 @@ class AudioAnalyzer:
             'sample_rate': self.sr,
             'tempo_bpm': float(tempo),
             'beat_times': beat_times.tolist(),
-            'small_peak_times': small_peaks.tolist(),
-            'big_peak_times': big_peaks.tolist(),
             'num_beats': len(beat_times),
-            'num_small_peaks': len(small_peaks),
-            'num_big_peaks': len(big_peaks),
+            # Original full-spectrum method
+            'fullspectrum': {
+                'tempo_bpm': float(tempo),
+                'small_peak_times': small_peaks.tolist(),
+                'big_peak_times': big_peaks.tolist(),
+            },
+            # Harmonic-percussive separation method
+            'percussive': {
+                'tempo_bpm': float(tempo),
+                'small_peak_times': small_peaks_percussive.tolist(),
+                'big_peak_times': big_peaks_percussive.tolist(),
+            },
+            # Low-frequency filtering method
+            'lowfreq': {
+                'tempo_bpm': float(tempo),
+                'small_peak_times': small_peaks_lowfreq.tolist(),
+                'big_peak_times': big_peaks_lowfreq.tolist(),
+            },
         }
+        
+        # Add Demucs results if available
+        if DEMUCS_AVAILABLE and len(small_peaks_demucs) > 0:
+            results['demucs'] = {
+                'tempo_bpm': float(tempo),
+                'small_peak_times': small_peaks_demucs.tolist(),
+                'big_peak_times': big_peaks_demucs.tolist(),
+            }
         
         return results
     

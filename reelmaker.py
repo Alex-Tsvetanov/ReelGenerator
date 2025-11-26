@@ -38,11 +38,27 @@ def analyze_audio_command(args):
     print(f"Duration: {results['duration']:.2f}s")
     print(f"Tempo: {results['tempo_bpm']:.1f} BPM")
     print(f"Beats: {results['num_beats']}")
-    print(f"Small peaks (effects): {results['num_small_peaks']}")
-    print(f"Big peaks (transitions): {results['num_big_peaks']}")
-    print(f"\nAverage images needed: {results['num_big_peaks'] + 1}")
-    print(f"Effect frequency: ~{results['duration']/results['num_small_peaks']:.2f}s")
-    print(f"Transition frequency: ~{results['duration']/results['num_big_peaks']:.2f}s")
+    
+    # Show summary for each detection method
+    methods = [('fullspectrum', 'Full Spectrum'), 
+               ('percussive', 'Percussive'), 
+               ('lowfreq', 'Low-Frequency')]
+    
+    # Add Demucs if available
+    if 'demucs' in results:
+        methods.append(('demucs', 'Demucs (Drums Only)'))
+    
+    for method_name, method_label in methods:
+        method_data = results[method_name]
+        num_small = len(method_data['small_peak_times'])
+        num_big = len(method_data['big_peak_times'])
+        print(f"\n{method_label}:")
+        print(f"  Small peaks (effects): {num_small}")
+        print(f"  Big peaks (transitions): {num_big}")
+        if num_big > 0:
+            print(f"  Avg images needed: {num_big + 1}")
+            print(f"  Effect frequency: ~{results['duration']/num_small:.2f}s")
+            print(f"  Transition frequency: ~{results['duration']/num_big:.2f}s")
 
 
 def batch_analyze_command(args):
@@ -108,7 +124,8 @@ def create_video_command(args):
         resolution=resolution,
         fps=args.fps,
         max_duration=args.max_duration,
-        min_transition_interval=args.min_transition_interval
+        min_transition_interval=args.min_transition_interval,
+        beat_method=args.beat_method
     )
     
     print("\n" + "=" * 70)
@@ -169,6 +186,9 @@ Examples:
                               help='Maximum duration in seconds (for testing, uses only first N seconds of audio)')
     create_parser.add_argument('--min-transition-interval', type=float, default=2.0,
                               help='Minimum time between image transitions in seconds (default: 2.0, prevents rapid flashing)')
+    create_parser.add_argument('--beat-method', type=str, default='fullspectrum',
+                              choices=['fullspectrum', 'percussive', 'lowfreq', 'demucs'],
+                              help='Beat detection method to use (default: fullspectrum, demucs recommended for vocals)')
     
     args = parser.parse_args()
     
